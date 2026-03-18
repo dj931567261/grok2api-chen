@@ -56,3 +56,6 @@ htmlcov/
 # Project specific
 config.local.toml
 .ace-tool/
+cloudflare/node_modules/
+cloudflare/.wrangler/
+cloudflare/wrangler.ci.toml

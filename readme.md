@@ -60,6 +60,14 @@ docker compose up -d
 >
 > 持久化请使用 MySQL / Redis / PostgreSQL，并设置：`SERVER_STORAGE_TYPE` 与 `SERVER_STORAGE_URL`。
 
+### Cloudflare Workers 部署
+
+Cloudflare Worker 版本已独立放在 `cloudflare/` 子项目中，避免与上游 FastAPI 主线互相干扰。
+
+- 入口文档：`cloudflare/README.md`
+- 自动部署：`.github/workflows/cloudflare-workers.yml`
+- 后续同步上游：优先同步根目录主线，再按需更新 `cloudflare/`
+
 <br>
 
 ## 管理面板
