@@ -1,211 +1,169 @@
 import { Hono } from "hono";
 import type { Env } from "./env";
-import { openAiRoutes } from "./routes/openai";
-import { mediaRoutes } from "./routes/media";
-import { adminRoutes } from "./routes/admin";
-import { runKvDailyClear } from "./kv/cleanup";
 
 const app = new Hono<{ Bindings: Env }>();
 
-function getAssets(env: Env): Fetcher | null {
-  const anyEnv = env as unknown as { ASSETS?: unknown };
-  const assets = anyEnv.ASSETS as { fetch?: unknown } | undefined;
-  return assets && typeof assets.fetch === "function" ? (assets as Fetcher) : null;
-}
+const HOP_BY_HOP_HEADERS = [
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+] as const;
+
+const CLOUDFLARE_HEADERS_TO_STRIP = [
+  "cf-connecting-ip",
+  "cf-ipcountry",
+  "cf-ray",
+  "cf-visitor",
+  "cdn-loop",
+  "x-forwarded-host",
+  "x-forwarded-proto",
+  "x-real-ip",
+] as const;
 
 function getBuildSha(env: Env): string {
-  const v = String((env as any)?.BUILD_SHA ?? "").trim();
-  return v || "dev";
+  return String(env.BUILD_SHA ?? "").trim() || "dev";
 }
 
-function isDebugRequest(c: any): boolean {
+function getUpstreamBaseUrl(env: Env): URL {
+  const raw = String(env.UPSTREAM_BASE_URL ?? "").trim();
+  if (!raw) {
+    throw new Error("Missing UPSTREAM_BASE_URL. Configure it in wrangler.toml or CI secrets.");
+  }
+
+  let url: URL;
   try {
-    return new URL(c.req.url).searchParams.get("debug") === "1";
+    url = new URL(raw);
   } catch {
-    return false;
+    throw new Error(`Invalid UPSTREAM_BASE_URL: ${raw}`);
+  }
+
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error(`Unsupported UPSTREAM_BASE_URL protocol: ${url.protocol}`);
+  }
+  return url;
+}
+
+function joinPath(basePath: string, requestPath: string): string {
+  const cleanBase = basePath === "/" ? "" : basePath.replace(/\/+$/, "");
+  const cleanRequest = requestPath.replace(/^\/+/, "");
+  return cleanBase ? `${cleanBase}/${cleanRequest}` : `/${cleanRequest}`;
+}
+
+function buildUpstreamUrl(requestUrl: string, env: Env): URL {
+  const incoming = new URL(requestUrl);
+  const upstream = getUpstreamBaseUrl(env);
+  upstream.pathname = joinPath(upstream.pathname, incoming.pathname);
+  upstream.search = incoming.search;
+  upstream.hash = incoming.hash;
+  return upstream;
+}
+
+function buildProxyHeaders(request: Request, upstreamUrl: URL): Headers {
+  const headers = new Headers(request.headers);
+
+  for (const header of HOP_BY_HOP_HEADERS) headers.delete(header);
+  for (const header of CLOUDFLARE_HEADERS_TO_STRIP) headers.delete(header);
+
+  headers.delete("host");
+
+  const incoming = new URL(request.url);
+  const forwardedFor =
+    request.headers.get("cf-connecting-ip") ||
+    request.headers.get("x-forwarded-for") ||
+    "";
+  if (forwardedFor) headers.set("x-forwarded-for", forwardedFor);
+  headers.set("x-forwarded-host", incoming.host);
+  headers.set("x-forwarded-proto", incoming.protocol.replace(/:$/, ""));
+  headers.set("x-forwarded-worker", "cloudflare");
+  headers.set("x-proxied-by", "grok2api-cloudflare-worker");
+  headers.set("origin", upstreamUrl.origin);
+
+  return headers;
+}
+
+function rewriteLocationHeader(location: string, requestUrl: string, upstreamBase: URL): string {
+  try {
+    const incoming = new URL(requestUrl);
+    const absolute = new URL(location, upstreamBase);
+    if (absolute.origin !== upstreamBase.origin) return location;
+
+    const rewritten = new URL(incoming.origin);
+    rewritten.pathname = absolute.pathname;
+    rewritten.search = absolute.search;
+    rewritten.hash = absolute.hash;
+    return rewritten.toString();
+  } catch {
+    return location;
   }
 }
 
-function withResponseHeaders(res: Response, extra: Record<string, string>): Response {
-  const headers = new Headers(res.headers);
-  for (const [k, v] of Object.entries(extra)) headers.set(k, v);
-  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
-}
+function withProxyHeaders(response: Response, requestUrl: string, env: Env): Response {
+  if (response.status === 101) return response;
 
-function assetFetchError(message: string, buildSha: string): Response {
-  return new Response(message, {
-    status: 500,
-    headers: { "content-type": "text/plain; charset=utf-8", "x-grok2api-build": buildSha },
+  const headers = new Headers(response.headers);
+  const location = headers.get("location");
+  if (location) {
+    headers.set("location", rewriteLocationHeader(location, requestUrl, getUpstreamBaseUrl(env)));
+  }
+  headers.set("x-grok2api-runtime", "cloudflare-worker-proxy");
+  headers.set("x-grok2api-build", getBuildSha(env));
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
   });
 }
 
-async function fetchAsset(c: any, pathname: string): Promise<Response> {
-  const assets = getAssets(c.env as Env);
-  const buildSha = getBuildSha(c.env as Env);
-  if (!assets) {
-    console.error("ASSETS binding missing: check wrangler.toml assets binding");
-    return assetFetchError(
-      'Internal Server Error: missing ASSETS binding. Check `wrangler.toml` `assets = { directory = \"./public\", binding = \"ASSETS\" }` and redeploy.',
-      buildSha,
-    );
-  }
+async function proxyRequest(request: Request, env: Env): Promise<Response> {
+  const upstreamUrl = buildUpstreamUrl(request.url, env);
+  const headers = buildProxyHeaders(request, upstreamUrl);
+  const method = request.method.toUpperCase();
 
-  const url = new URL(c.req.url);
-  url.pathname = pathname;
-  try {
-    const res = await assets.fetch(new Request(url.toString(), c.req.raw));
-    const extra: Record<string, string> = { "x-grok2api-build": buildSha };
+  const init: RequestInit = {
+    method,
+    headers,
+    redirect: "manual",
+  };
+  if (method !== "GET" && method !== "HEAD") init.body = request.body;
 
-    // Avoid caching UI files aggressively, otherwise users may keep seeing old UI after redeploy.
-    // We keep images/videos cacheable (handled by KV + cache proxy paths), but HTML/JS/CSS should refresh quickly.
-    const lower = pathname.toLowerCase();
-    if (lower.endsWith(".html") || lower.endsWith(".js") || lower.endsWith(".css")) {
-      extra["cache-control"] = "no-store, no-cache, must-revalidate";
-      extra["pragma"] = "no-cache";
-      extra["expires"] = "0";
-    }
+  const upstreamRequest = new Request(upstreamUrl.toString(), init);
 
-    return withResponseHeaders(res, extra);
-  } catch (err) {
-    console.error(`ASSETS fetch failed (${pathname}):`, err);
-    const detail = isDebugRequest(c) ? `\n\n${err instanceof Error ? err.stack || err.message : String(err)}` : "";
-    return assetFetchError(`Internal Server Error: failed to fetch asset ${pathname}.${detail}`, buildSha);
-  }
+  const response = await fetch(upstreamRequest);
+  return withProxyHeaders(response, request.url, env);
 }
 
-app.onError((err, c) => {
-  console.error("Unhandled error:", err);
-  const buildSha = getBuildSha(c.env as Env);
-  const detail = isDebugRequest(c) ? `\n\n${err instanceof Error ? err.stack || err.message : String(err)}` : "";
-  const res = c.text(`Internal Server Error${detail}`, 500);
-  return withResponseHeaders(res, { "x-grok2api-build": buildSha });
-});
-
-app.route("/v1", openAiRoutes);
-app.route("/", mediaRoutes);
-app.route("/", adminRoutes);
-
-// Backward-compatible local-cache viewer URLs used by the multi-page admin UI.
-// In Workers we serve cache via /images/*, so redirect /v1/files/* to /images/*.
-app.get("/v1/files/image/:imgPath{.+}", (c) =>
-  c.redirect(`/images/${encodeURIComponent(c.req.param("imgPath"))}`, 302),
-);
-app.get("/v1/files/video/:imgPath{.+}", (c) =>
-  c.redirect(`/images/${encodeURIComponent(c.req.param("imgPath"))}`, 302),
-);
-
-app.get("/_worker.js", (c) => c.notFound());
-
-app.get("/", (c) => c.redirect("/login", 302));
-
-app.get("/login", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/login?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/login/login.html");
-});
-
-// Legacy (old admin UI): keep /manage as an alias.
-app.get("/manage", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/admin/token?v=${encodeURIComponent(buildSha)}`, 302);
-  return c.redirect(`/admin/token?v=${encodeURIComponent(buildSha)}`, 302);
-});
-
-app.get("/admin", (c) => c.redirect("/login", 302));
-
-app.get("/admin/token", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/admin/token?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/token/token.html");
-});
-
-app.get("/admin/datacenter", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/admin/datacenter?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/datacenter/datacenter.html");
-});
-
-app.get("/admin/config", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/admin/config?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/config/config.html");
-});
-
-app.get("/admin/cache", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/admin/cache?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/cache/cache.html");
-});
-
-app.get("/admin/keys", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/admin/keys?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/keys/keys.html");
-});
-
-app.get("/chat", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/chat?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/chat/chat.html");
-});
-
-app.get("/admin/chat", (c) => {
-  const buildSha = getBuildSha(c.env as Env);
-  const v = c.req.query("v") ?? "";
-  if (v !== buildSha) return c.redirect(`/admin/chat?v=${encodeURIComponent(buildSha)}`, 302);
-  return fetchAsset(c, "/chat/chat_admin.html");
-});
-
-app.get("/static/*", (c) => {
-  const url = new URL(c.req.url);
-  if (url.pathname === "/static/_worker.js") return c.notFound();
-  url.pathname = url.pathname.replace(/^\/static\//, "/");
-  return fetchAsset(c, url.pathname);
-});
-
-app.get("/health", (c) =>
+app.get("/_worker/health", (c) =>
   c.json({
-    status: "healthy",
-    service: "Grok2API",
-    runtime: "cloudflare-workers",
-    build: { sha: getBuildSha(c.env as Env) },
-    bindings: {
-      db: Boolean((c.env as any)?.DB),
-      kv_cache: Boolean((c.env as any)?.KV_CACHE),
-      assets: Boolean(getAssets(c.env as any)),
-    },
+    status: "ok",
+    runtime: "cloudflare-worker-proxy",
+    build: { sha: getBuildSha(c.env) },
+    upstream: getUpstreamBaseUrl(c.env).origin,
   }),
 );
 
-app.notFound(async (c) => {
-  const assets = getAssets(c.env as any);
-  const buildSha = getBuildSha(c.env as Env);
-  // Avoid calling c.notFound() here because it will invoke this handler again.
-  if (!assets) return withResponseHeaders(c.text("Not Found", 404), { "x-grok2api-build": buildSha });
-  try {
-    const res = await assets.fetch(c.req.raw);
-    // Keep the header consistent for debugging/version checks.
-    return withResponseHeaders(res, { "x-grok2api-build": buildSha });
-  } catch (err) {
-    console.error("ASSETS fetch failed (notFound):", err);
-    const detail = isDebugRequest(c) ? `\n\n${err instanceof Error ? err.stack || err.message : String(err)}` : "";
-    return withResponseHeaders(c.text(`Internal Server Error${detail}`, 500), { "x-grok2api-build": buildSha });
-  }
+app.onError((err, c) => {
+  console.error("Worker proxy error:", err);
+  return c.json(
+    {
+      status: "error",
+      runtime: "cloudflare-worker-proxy",
+      message: err instanceof Error ? err.message : String(err),
+      build: { sha: getBuildSha(c.env) },
+    },
+    502,
+  );
 });
 
-const handler: ExportedHandler<Env> = {
-  fetch: (request, env, ctx) => app.fetch(request, env, ctx),
-  scheduled: (_event, env, ctx) => {
-    ctx.waitUntil(runKvDailyClear(env));
-  },
-};
+app.all("*", async (c) => proxyRequest(c.req.raw, c.env));
 
-export default handler;
+export default {
+  fetch(request: Request, env: Env, ctx: ExecutionContext) {
+    return app.fetch(request, env, ctx);
+  },
+} satisfies ExportedHandler<Env>;

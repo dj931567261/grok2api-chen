@@ -8,7 +8,6 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "db:migrate": "wrangler d1 migrations apply DB --remote",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

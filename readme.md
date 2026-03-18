@@ -62,11 +62,11 @@ docker compose up -d
 
 ### Cloudflare Workers 部署
 
-Cloudflare Worker 版本已独立放在 `cloudflare/` 子项目中，避免与上游 FastAPI 主线互相干扰。
+Cloudflare Worker 版本已独立放在 `cloudflare/` 子项目中，但它现在只负责作为主线后端的 Cloudflare 反向代理入口。
 
 - 入口文档：`cloudflare/README.md`
 - 自动部署：`.github/workflows/cloudflare-workers.yml`
-- 后续同步上游：优先同步根目录主线，再按需更新 `cloudflare/`
+- 后续同步上游：优先同步根目录主线，Worker 仅保留转发适配层
 
 <br>
 
